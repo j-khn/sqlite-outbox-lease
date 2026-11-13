@@ -123,8 +123,8 @@ class SQLiteOutbox:
         current = time.time() if now is None else now
         self._owned_update(
             "UPDATE outbox_messages SET delivered_at=?,locked_by=NULL,lease_until=NULL "
-            "WHERE id=? AND locked_by=? AND delivered_at IS NULL",
-            (current, message_id, lease_token),
+            "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
+            (current, message_id, lease_token, current),
         )
 
     def retry(
@@ -141,8 +141,8 @@ class SQLiteOutbox:
         current = time.time() if now is None else now
         self._owned_update(
             "UPDATE outbox_messages SET available_at=?,last_error=?,locked_by=NULL,lease_until=NULL "
-            "WHERE id=? AND locked_by=? AND delivered_at IS NULL",
-            (current + delay_seconds, error[:2000], message_id, lease_token),
+            "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
+            (current + delay_seconds, error[:2000], message_id, lease_token, current),
         )
 
     def extend(
@@ -158,8 +158,8 @@ class SQLiteOutbox:
         current = time.time() if now is None else now
         self._owned_update(
             "UPDATE outbox_messages SET lease_until=? "
-            "WHERE id=? AND locked_by=? AND delivered_at IS NULL",
-            (current + lease_seconds, message_id, lease_token),
+            "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
+            (current + lease_seconds, message_id, lease_token, current),
         )
 
     def _owned_update(self, statement: str, parameters: tuple[object, ...]) -> None:

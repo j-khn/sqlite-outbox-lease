@@ -31,6 +31,32 @@ class OutboxLeaseTests(unittest.TestCase):
         self.outbox.ack(message_id, second.lease_token, now=16)
         self.assertEqual(self.outbox.claim("next", now=17), [])
 
+    def test_expired_lease_cannot_be_completed_before_reclaim(self):
+        message_id = self.outbox.enqueue("invoice.created", b"payload", now=10)
+        message = self.outbox.claim("worker", now=10, lease_seconds=5)[0]
+        expired_at = 15
+        operations = {
+            "ack": lambda: self.outbox.ack(message_id, message.lease_token, now=expired_at),
+            "retry": lambda: self.outbox.retry(
+                message_id,
+                message.lease_token,
+                delay_seconds=0,
+                error="late retry",
+                now=expired_at,
+            ),
+            "extend": lambda: self.outbox.extend(
+                message_id, message.lease_token, lease_seconds=5, now=expired_at
+            ),
+        }
+        for operation_name, operation in operations.items():
+            with self.subTest(operation=operation_name):
+                with self.assertRaises(LeaseLost):
+                    operation()
+
+        reclaimed = self.outbox.claim("next-worker", now=expired_at, lease_seconds=5)
+        self.assertEqual(len(reclaimed), 1)
+        self.assertEqual(reclaimed[0].id, message_id)
+
     def test_concurrent_workers_claim_disjoint_rows(self):
         for index in range(10):
             self.outbox.enqueue("job", str(index).encode(), now=1)

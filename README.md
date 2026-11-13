@@ -23,7 +23,7 @@ for message in outbox.claim("worker-1", limit=10, lease_seconds=30):
         outbox.ack(message.id, message.lease_token)
 ```
 
-For atomic writes, pass the application's SQLite connection to `enqueue` inside the same transaction that updates domain data. A worker can reclaim a message after its lease expires. If an older worker later tries to acknowledge or retry it, the lease token no longer matches and `LeaseLost` is raised.
+For atomic writes, pass the application's SQLite connection to `enqueue` inside the same transaction that updates domain data. A worker can reclaim a message after its lease expires. Acknowledgement, retry, and lease extension require an active lease; after expiration they raise `LeaseLost`, even if another worker has not reclaimed the message yet. Reclaiming assigns a new fencing token so late actions from an older worker cannot affect the message.
 
 ## What it provides
 
