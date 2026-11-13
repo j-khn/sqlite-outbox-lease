@@ -1,179 +1,52 @@
-from __future__ import annotations
+# SQLite Outbox Lease
 
 > **Status:** Early-stage reference implementation; APIs may change.
 
-from dataclasses import dataclass
-from pathlib import Path
-import secrets
-import sqlite3
-import time
+A small SQLite transactional outbox for background work that must survive process restarts.
 
+The library stores messages durably, lets workers claim them with expiring leases, and uses a unique lease token to reject acknowledgements from stale workers. It is useful when a service already uses SQLite and needs a clear, testable foundation for reliable dispatch.
 
-class LeaseLost(RuntimeError):
-    pass
+## Example
 
+```python
+from sqlite_outbox_lease import SQLiteOutbox
 
-@dataclass(frozen=True)
-class Message:
-    id: int
-    topic: str
-    payload: bytes
-    attempts: int
-    lease_token: str
+outbox = SQLiteOutbox("service.sqlite3")
+outbox.enqueue("email.send", b'{"to":"dev@example.com"}')
 
+for message in outbox.claim("worker-1", limit=10, lease_seconds=30):
+    try:
+        send_to_provider(message.topic, message.payload)
+    except TemporaryProviderError as error:
+        outbox.retry(message.id, message.lease_token, error=str(error), delay_seconds=10)
+    else:
+        outbox.ack(message.id, message.lease_token)
+```
 
-class SQLiteOutbox:
-    def __init__(self, path: str | Path):
-        self.path = str(path)
-        if self.path == ":memory:":
-            raise ValueError("use a file path so workers share durable state")
-        Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        connection = self._connection()
-        try:
-            connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS outbox_messages ("
-                "id INTEGER PRIMARY KEY AUTOINCREMENT, topic TEXT NOT NULL, "
-                "payload BLOB NOT NULL, created_at REAL NOT NULL, "
-                "available_at REAL NOT NULL, delivered_at REAL, locked_by TEXT, "
-                "lease_until REAL, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS outbox_ready "
-                "ON outbox_messages(delivered_at,available_at,lease_until,id)"
-            )
-        finally:
-            connection.close()
+For atomic writes, pass the application's SQLite connection to `enqueue` inside the same transaction that updates domain data. A worker can reclaim a message after its lease expires. If an older worker later tries to acknowledge or retry it, the lease token no longer matches and `LeaseLost` is raised.
 
-    def _connection(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5, isolation_level=None)
-        connection.execute("PRAGMA busy_timeout = 5000")
-        return connection
+## What it provides
 
-    def enqueue(
-        self,
-        topic: str,
-        payload: bytes,
-        *,
-        now: float | None = None,
-        connection: sqlite3.Connection | None = None,
-    ) -> int:
-        if not topic:
-            raise ValueError("topic must not be empty")
-        if not isinstance(payload, bytes):
-            raise TypeError("payload must be bytes")
-        current = time.time() if now is None else now
-        statement = (
-            "INSERT INTO outbox_messages(topic,payload,created_at,available_at) "
-            "VALUES (?,?,?,?)"
-        )
-        if connection is not None:
-            cursor = connection.execute(statement, (topic, payload, current, current))
-            return int(cursor.lastrowid)
+- Durable messages stored in SQLite.
+- Ordered claims with bounded batch sizes.
+- Expiring leases for worker recovery.
+- Fencing tokens that prevent stale workers from completing a newer claim.
+- Retry scheduling with a caller-supplied delay.
+- An `ack` API for marking successful deliveries.
 
-        owned = self._connection()
-        try:
-            cursor = owned.execute(statement, (topic, payload, current, current))
-            return int(cursor.lastrowid)
-        finally:
-            owned.close()
+## Delivery model and limits
 
-    def claim(
-        self,
-        worker_id: str,
-        *,
-        limit: int = 20,
-        lease_seconds: float = 30,
-        now: float | None = None,
-    ) -> list[Message]:
-        if not worker_id or limit < 1 or lease_seconds <= 0:
-            raise ValueError("worker_id, positive limit, and positive lease are required")
-        current = time.time() if now is None else now
-        lease_until = current + lease_seconds
-        connection = self._connection()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            rows = connection.execute(
-                "SELECT id,topic,payload,attempts FROM outbox_messages "
-                "WHERE delivered_at IS NULL AND available_at <= ? "
-                "AND (lease_until IS NULL OR lease_until <= ?) "
-                "ORDER BY id LIMIT ?",
-                (current, current, limit),
-            ).fetchall()
-            messages: list[Message] = []
-            for message_id, topic, payload, attempts in rows:
-                lease_token = worker_id + ":" + secrets.token_urlsafe(18)
-                cursor = connection.execute(
-                    "UPDATE outbox_messages SET locked_by=?,lease_until=?,attempts=attempts+1 "
-                    "WHERE id=? AND delivered_at IS NULL "
-                    "AND (lease_until IS NULL OR lease_until <= ?)",
-                    (lease_token, lease_until, message_id, current),
-                )
-                if cursor.rowcount == 1:
-                    messages.append(
-                        Message(message_id, topic, bytes(payload), attempts + 1, lease_token)
-                    )
-            connection.commit()
-            return messages
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+This is an **at-least-once** outbox primitive. A process can crash after a provider accepts a message but before `ack` commits, so consumers should be idempotent. The package does not provide a broker, automatic retry policy, payload codec, or schema migration framework. It uses SQLite WAL mode and file-backed databases; all workers must access the same database file.
 
-    def ack(self, message_id: int, lease_token: str, *, now: float | None = None) -> None:
-        current = time.time() if now is None else now
-        self._owned_update(
-            "UPDATE outbox_messages SET delivered_at=?,locked_by=NULL,lease_until=NULL "
-            "WHERE id=? AND locked_by=? AND delivered_at IS NULL",
-            (current, message_id, lease_token),
-        )
+## Development
 
-    def retry(
-        self,
-        message_id: int,
-        lease_token: str,
-        *,
-        delay_seconds: float,
-        error: str,
-        now: float | None = None,
-    ) -> None:
-        if delay_seconds < 0:
-            raise ValueError("delay_seconds must be non-negative")
-        current = time.time() if now is None else now
-        self._owned_update(
-            "UPDATE outbox_messages SET available_at=?,last_error=?,locked_by=NULL,lease_until=NULL "
-            "WHERE id=? AND locked_by=? AND delivered_at IS NULL",
-            (current + delay_seconds, error[:2000], message_id, lease_token),
-        )
+```sh
+python -m pip install -e .
+python -m unittest discover -s tests -v
+```
 
-    def extend(
-        self,
-        message_id: int,
-        lease_token: str,
-        *,
-        lease_seconds: float,
-        now: float | None = None,
-    ) -> None:
-        if lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive")
-        current = time.time() if now is None else now
-        self._owned_update(
-            "UPDATE outbox_messages SET lease_until=? "
-            "WHERE id=? AND locked_by=? AND delivered_at IS NULL",
-            (current + lease_seconds, message_id, lease_token),
-        )
+The GitHub Actions workflow runs the test suite on pushes and pull requests.
 
-    def _owned_update(self, statement: str, parameters: tuple[object, ...]) -> None:
-        connection = self._connection()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            cursor = connection.execute(statement, parameters)
-            if cursor.rowcount != 1:
-                raise LeaseLost("message is missing, delivered, or held by another worker")
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
+## License
+
+MIT. See [LICENSE](LICENSE).
