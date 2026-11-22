@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import secrets
 import sqlite3
 import time
@@ -60,7 +61,7 @@ class SQLiteOutbox:
             raise ValueError("topic must not be empty")
         if not isinstance(payload, bytes):
             raise TypeError("payload must be bytes")
-        current = time.time() if now is None else now
+        current = self._current_time(now)
         statement = (
             "INSERT INTO outbox_messages(topic,payload,created_at,available_at) "
             "VALUES (?,?,?,?)"
@@ -84,10 +85,13 @@ class SQLiteOutbox:
         lease_seconds: float = 30,
         now: float | None = None,
     ) -> list[Message]:
-        if (not worker_id or type(limit) is not int or limit < 1 or lease_seconds <= 0):
-            raise ValueError("worker_id, positive limit, and positive lease are required")
-        current = time.time() if now is None else now
-        lease_until = current + lease_seconds
+        if (
+            not worker_id or type(limit) is not int or limit < 1
+            or lease_seconds <= 0 or not math.isfinite(lease_seconds)
+        ):
+            raise ValueError("worker_id, positive limit, and finite positive lease are required")
+        current = self._current_time(now)
+        lease_until = self._deadline(current, lease_seconds)
         connection = self._connection()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -120,7 +124,7 @@ class SQLiteOutbox:
             connection.close()
 
     def ack(self, message_id: int, lease_token: str, *, now: float | None = None) -> None:
-        current = time.time() if now is None else now
+        current = self._current_time(now)
         self._owned_update(
             "UPDATE outbox_messages SET delivered_at=?,locked_by=NULL,lease_until=NULL "
             "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
@@ -136,13 +140,14 @@ class SQLiteOutbox:
         error: str,
         now: float | None = None,
     ) -> None:
-        if delay_seconds < 0:
-            raise ValueError("delay_seconds must be non-negative")
-        current = time.time() if now is None else now
+        if delay_seconds < 0 or not math.isfinite(delay_seconds):
+            raise ValueError("delay_seconds must be finite and non-negative")
+        current = self._current_time(now)
+        available_at = self._deadline(current, delay_seconds)
         self._owned_update(
             "UPDATE outbox_messages SET available_at=?,last_error=?,locked_by=NULL,lease_until=NULL "
             "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
-            (current + delay_seconds, error[:2000], message_id, lease_token, current),
+            (available_at, error[:2000], message_id, lease_token, current),
         )
 
     def extend(
@@ -153,14 +158,29 @@ class SQLiteOutbox:
         lease_seconds: float,
         now: float | None = None,
     ) -> None:
-        if lease_seconds <= 0:
-            raise ValueError("lease_seconds must be positive")
-        current = time.time() if now is None else now
+        if lease_seconds <= 0 or not math.isfinite(lease_seconds):
+            raise ValueError("lease_seconds must be finite and positive")
+        current = self._current_time(now)
+        lease_until = self._deadline(current, lease_seconds)
         self._owned_update(
             "UPDATE outbox_messages SET lease_until=? "
             "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
-            (current + lease_seconds, message_id, lease_token, current),
+            (lease_until, message_id, lease_token, current),
         )
+
+    @staticmethod
+    def _current_time(now: float | None) -> float:
+        current = time.time() if now is None else now
+        if not math.isfinite(current):
+            raise ValueError("now must be finite")
+        return current
+
+    @staticmethod
+    def _deadline(current: float, duration: float) -> float:
+        deadline = current + duration
+        if not math.isfinite(deadline):
+            raise ValueError("scheduled time must be finite")
+        return deadline
 
     def _owned_update(self, statement: str, parameters: tuple[object, ...]) -> None:
         connection = self._connection()

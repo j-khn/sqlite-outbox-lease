@@ -87,6 +87,46 @@ class OutboxLeaseTests(unittest.TestCase):
             connection.close()
         self.assertEqual(self.outbox.claim("worker", now=2), [])
 
+    def test_non_finite_time_and_lease_cannot_strand_message(self):
+        with self.assertRaises(ValueError):
+            self.outbox.enqueue("job", b"payload", now=float("inf"))
+        message_id = self.outbox.enqueue("job", b"payload", now=10)
+
+        for duration in (float("nan"), float("inf")):
+            with self.subTest(duration=duration):
+                with self.assertRaises(ValueError):
+                    self.outbox.claim("worker", now=10, lease_seconds=duration)
+        with self.assertRaises(ValueError):
+            self.outbox.claim("worker", now=1e308, lease_seconds=1e308)
+
+        claimed = self.outbox.claim("worker", now=10, lease_seconds=5)
+        self.assertEqual([message.id for message in claimed], [message_id])
+
+    def test_non_finite_retry_and_extension_leave_lease_reclaimable(self):
+        message_id = self.outbox.enqueue("job", b"payload", now=10)
+        message = self.outbox.claim("worker", now=10, lease_seconds=5)[0]
+
+        with self.assertRaises(ValueError):
+            self.outbox.retry(
+                message_id, message.lease_token,
+                delay_seconds=float("inf"), error="busy", now=11,
+            )
+        with self.assertRaises(ValueError):
+            self.outbox.retry(
+                message_id, message.lease_token,
+                delay_seconds=1e308, error="busy", now=1e308,
+            )
+        with self.assertRaises(ValueError):
+            self.outbox.extend(
+                message_id, message.lease_token,
+                lease_seconds=float("nan"), now=11,
+            )
+        with self.assertRaises(ValueError):
+            self.outbox.ack(message_id, message.lease_token, now=float("nan"))
+
+        reclaimed = self.outbox.claim("next-worker", now=15)
+        self.assertEqual([item.id for item in reclaimed], [message_id])
+
 
 if __name__ == "__main__":
     unittest.main()
