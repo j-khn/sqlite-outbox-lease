@@ -57,6 +57,18 @@ class OutboxLeaseTests(unittest.TestCase):
         self.assertEqual(len(reclaimed), 1)
         self.assertEqual(reclaimed[0].id, message_id)
 
+    def test_extend_never_shortens_an_active_lease(self):
+        message_id = self.outbox.enqueue("job", b"payload", now=10)
+        message = self.outbox.claim("worker", now=10, lease_seconds=20)[0]
+
+        self.outbox.extend(message_id, message.lease_token, now=11, lease_seconds=2)
+        self.assertEqual(self.outbox.claim("other", now=13), [])
+
+        self.outbox.extend(message_id, message.lease_token, now=14, lease_seconds=25)
+        self.assertEqual(self.outbox.claim("other", now=30), [])
+        reclaimed = self.outbox.claim("other", now=39)
+        self.assertEqual([item.id for item in reclaimed], [message_id])
+
     def test_concurrent_workers_claim_disjoint_rows(self):
         for index in range(10):
             self.outbox.enqueue("job", str(index).encode(), now=1)

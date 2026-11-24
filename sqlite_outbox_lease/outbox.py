@@ -163,7 +163,7 @@ class SQLiteOutbox:
         current = self._current_time(now)
         lease_until = self._deadline(current, lease_seconds)
         self._owned_update(
-            "UPDATE outbox_messages SET lease_until=? "
+            "UPDATE outbox_messages SET lease_until=MAX(lease_until, ?) "
             "WHERE id=? AND locked_by=? AND delivered_at IS NULL AND lease_until > ?",
             (lease_until, message_id, lease_token, current),
         )

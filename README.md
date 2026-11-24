@@ -25,6 +25,8 @@ for message in outbox.claim("worker-1", limit=10, lease_seconds=30):
 
 For atomic writes, pass the application's SQLite connection to `enqueue` inside the same transaction that updates domain data. A worker can reclaim a message after its lease expires. Acknowledgement, retry, and lease extension require an active lease; after expiration they raise `LeaseLost`, even if another worker has not reclaimed the message yet. Reclaiming assigns a new fencing token so late actions from an older worker cannot affect the message.
 
+`extend` keeps the later of the current deadline and the requested deadline, so a shorter extension cannot release a message early.
+
 Explicit `now` values, lease durations, retry delays, and their resulting deadlines must be finite. Invalid values raise `ValueError` before changing a message.
 
 ## What it provides
