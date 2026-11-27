@@ -6,6 +6,8 @@ A small SQLite transactional outbox for background work that must survive proces
 
 The library stores messages durably, lets workers claim them with expiring leases, and uses a unique lease token to reject acknowledgements from stale workers. It is useful when a service already uses SQLite and needs a clear, testable foundation for reliable dispatch.
 
+Relative database paths are resolved when the `SQLiteOutbox` is created, so later changes to the process working directory do not redirect operations to a different database file.
+
 ## Example
 
 ```python

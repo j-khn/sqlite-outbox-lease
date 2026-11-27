@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -98,6 +99,30 @@ class OutboxLeaseTests(unittest.TestCase):
         finally:
             connection.close()
         self.assertEqual(self.outbox.claim("worker", now=2), [])
+
+    def test_relative_path_stays_anchored_after_chdir(self):
+        original_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workdir = root / "work"
+            elsewhere = root / "elsewhere"
+            workdir.mkdir()
+            elsewhere.mkdir()
+            try:
+                os.chdir(workdir)
+                outbox = SQLiteOutbox("data/outbox.sqlite3")
+                expected_path = (workdir / "data/outbox.sqlite3").resolve()
+
+                os.chdir(elsewhere)
+                message_id = outbox.enqueue("job", b"payload", now=1)
+                claimed = outbox.claim("worker", now=2)
+
+                self.assertEqual(outbox.path, str(expected_path))
+                self.assertEqual([message.id for message in claimed], [message_id])
+                self.assertTrue(expected_path.exists())
+                self.assertFalse((elsewhere / "data/outbox.sqlite3").exists())
+            finally:
+                os.chdir(original_cwd)
 
     def test_non_finite_time_and_lease_cannot_strand_message(self):
         with self.assertRaises(ValueError):

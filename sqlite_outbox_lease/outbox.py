@@ -23,9 +23,11 @@ class Message:
 
 class SQLiteOutbox:
     def __init__(self, path: str | Path):
-        self.path = str(path)
-        if self.path == ":memory:":
+        raw_path = str(path)
+        if raw_path == ":memory:":
             raise ValueError("use a file path so workers share durable state")
+        # Resolve relative paths once so a later chdir cannot switch databases.
+        self.path = str(Path(raw_path).resolve())
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         connection = self._connection()
         try:
